@@ -99,11 +99,19 @@ impl DecodeBuffer {
     }
 
     fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
+        // Special case for offset=1 (RLE): fill with a single byte repeatedly
+        // This is optimized with SIMD on WASM targets
+        if offset == 1 {
+            // Get the byte to repeat from the buffer
+            let byte = self.buffer.get(start_idx).unwrap();
+            self.buffer.extend_with_byte(byte, match_length);
+            return;
+        }
+
         // We have at max offset bytes in one chunk, the last one can be smaller
         let mut start_idx = start_idx;
         let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
+        // Each time we copy a chunk we have a repetition of length 'offset', so we can copy offset * iteration many bytes from start_idx
         while copied_counter_left > 0 {
             let chunksize = usize::min(offset, copied_counter_left);
 

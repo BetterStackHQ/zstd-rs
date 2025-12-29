@@ -180,6 +180,40 @@ impl RingBuffer {
         self.tail = (self.tail + len) % self.cap;
     }
 
+    /// Append `len` copies of `byte` to the end of `self`.
+    /// This is optimized for WASM SIMD when available.
+    pub fn extend_with_byte(&mut self, byte: u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+
+        self.reserve(len);
+
+        debug_assert!(self.len() + len <= self.cap - 1);
+        debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
+
+        let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
+        debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
+
+        let in_f1 = usize::min(len, f1_len);
+        let in_f2 = len - in_f1;
+
+        debug_assert!(in_f1 + in_f2 == len);
+
+        unsafe {
+            // SAFETY: `in_f₁ + in_f₂ = len`, so this writes `len` bytes total
+            // upholding invariant 2
+            if in_f1 > 0 {
+                fill_byte_fast(f1_ptr, byte, in_f1);
+            }
+            if in_f2 > 0 {
+                fill_byte_fast(f2_ptr, byte, in_f2);
+            }
+        }
+        // SAFETY: Upholds invariant 3 by wrapping `tail` around.
+        self.tail = (self.tail + len) % self.cap;
+    }
+
     /// Advance head past `amount` elements, effectively removing
     /// them from the buffer.
     pub fn drop_first_n(&mut self, amount: usize) {
@@ -641,6 +675,47 @@ unsafe fn copy_bytes_overshooting(
         slice::from_raw_parts(src.0, copy_at_least),
         slice::from_raw_parts(dst.0, copy_at_least)
     );
+}
+
+/// Fill `len` bytes at `dst` with the value `byte`.
+/// Optimized for WASM SIMD when available.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+#[inline(always)]
+unsafe fn fill_byte_fast(dst: *mut u8, byte: u8, len: usize) {
+    // Non-SIMD fallback: use write_bytes (memset)
+    dst.write_bytes(byte, len);
+}
+
+/// WASM SIMD128 optimized version of fill_byte_fast.
+/// Uses u8x16_splat to create a vector of repeated bytes, then stores 16 bytes at a time.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+unsafe fn fill_byte_fast(dst: *mut u8, byte: u8, len: usize) {
+    use core::arch::wasm32::{u8x16_splat, v128, v128_store};
+
+    const SIMD_WIDTH: usize = 16;
+
+    if len >= SIMD_WIDTH {
+        let splat = u8x16_splat(byte);
+        let mut offset = 0;
+
+        // Write 16 bytes at a time
+        while offset + SIMD_WIDTH <= len {
+            v128_store(dst.add(offset) as *mut v128, splat);
+            offset += SIMD_WIDTH;
+        }
+
+        // Handle remaining bytes
+        while offset < len {
+            *dst.add(offset) = byte;
+            offset += 1;
+        }
+    } else {
+        // Small fills: just write bytes directly
+        for i in 0..len {
+            *dst.add(i) = byte;
+        }
+    }
 }
 
 #[allow(dead_code)]
