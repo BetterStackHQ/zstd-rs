@@ -25,61 +25,36 @@
 use ruzstd::decoding::FrameDecoder;
 use wasm_bindgen::prelude::*;
 
-// Include multiple large test files at compile time for more comprehensive benchmarking
-const TEST_FILES: &[&[u8]] = &[
-    include_bytes!("../../ruzstd/decodecorpus_files/z000091.zst"), // 459KB - largest
-    include_bytes!("../../ruzstd/decodecorpus_files/z000033.zst"), // 427KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000035.zst"), // 403KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000050.zst"), // 320KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000011.zst"), // 255KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000044.zst"), // 240KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000092.zst"), // 240KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000070.zst"), // 225KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000026.zst"), // 205KB
-    include_bytes!("../../ruzstd/decodecorpus_files/z000079.zst"), // 203KB
-];
+// Large test file: 200MB uncompressed, ~1.4MB compressed
+// Contains mix of RLE patterns, repeated sequences, and some random data
+const LARGE_TEST_FILE: &[u8] = include_bytes!("../test_data_200mb.zst");
 
-/// Returns the total size of all compressed test data in bytes
+/// Returns the size of compressed test data in bytes
 #[wasm_bindgen]
 pub fn get_compressed_size() -> usize {
-    TEST_FILES.iter().map(|f| f.len()).sum()
+    LARGE_TEST_FILE.len()
 }
 
-/// Returns the number of test files
-#[wasm_bindgen]
-pub fn get_file_count() -> usize {
-    TEST_FILES.len()
-}
-
-/// Run decompression of all test files once and return the total decompressed size in bytes
+/// Run decompression once and return the decompressed size in bytes
 #[wasm_bindgen]
 pub fn decompress_once() -> usize {
     let mut decoder = FrameDecoder::new();
-    let mut output = vec![0u8; 200 * 1024 * 1024]; // 200MB buffer
-    let mut total_bytes = 0;
+    let mut output = vec![0u8; 210 * 1024 * 1024]; // 210MB buffer
 
-    for file in TEST_FILES {
-        let bytes = decoder.decode_all(file, &mut output).unwrap();
-        total_bytes += bytes;
-    }
-
-    total_bytes
+    decoder.decode_all(LARGE_TEST_FILE, &mut output).unwrap()
 }
 
 /// Run the decompression benchmark for the specified number of iterations.
-/// Each iteration decompresses all test files.
 /// Returns the total bytes decompressed.
 #[wasm_bindgen]
 pub fn run_benchmark(iterations: u32) -> usize {
     let mut decoder = FrameDecoder::new();
-    let mut output = vec![0u8; 200 * 1024 * 1024]; // 200MB buffer
+    let mut output = vec![0u8; 210 * 1024 * 1024]; // 210MB buffer
     let mut total_bytes = 0;
 
     for _ in 0..iterations {
-        for file in TEST_FILES {
-            let bytes = decoder.decode_all(file, &mut output).unwrap();
-            total_bytes += bytes;
-        }
+        let bytes = decoder.decode_all(LARGE_TEST_FILE, &mut output).unwrap();
+        total_bytes += bytes;
     }
 
     total_bytes

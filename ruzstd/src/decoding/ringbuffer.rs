@@ -214,6 +214,51 @@ impl RingBuffer {
         self.tail = (self.tail + len) % self.cap;
     }
 
+    /// Append `len` bytes to the end of `self` by repeating a pattern.
+    /// The pattern is read from offset `pattern_start` in the buffer with length `pattern_len`.
+    /// `pattern_len` must be 2, 4, or 8 for SIMD optimization.
+    /// This is optimized for WASM SIMD when available.
+    pub fn extend_with_pattern(&mut self, pattern_start: usize, pattern_len: usize, len: usize) {
+        debug_assert!(pattern_len == 2 || pattern_len == 4 || pattern_len == 8);
+        debug_assert!(pattern_start + pattern_len <= self.len());
+
+        if len == 0 {
+            return;
+        }
+
+        // First, read the pattern bytes into a local buffer
+        let mut pattern_buf = [0u8; 8];
+        for i in 0..pattern_len {
+            pattern_buf[i] = self.get(pattern_start + i).unwrap();
+        }
+
+        self.reserve(len);
+
+        debug_assert!(self.len() + len <= self.cap - 1);
+        debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
+
+        let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
+        debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
+
+        let in_f1 = usize::min(len, f1_len);
+        let in_f2 = len - in_f1;
+
+        debug_assert!(in_f1 + in_f2 == len);
+
+        unsafe {
+            // SAFETY: `in_f₁ + in_f₂ = len`, so this writes `len` bytes total
+            // upholding invariant 2
+            if in_f1 > 0 {
+                fill_pattern_fast(f1_ptr, pattern_buf.as_ptr(), pattern_len, in_f1);
+            }
+            if in_f2 > 0 {
+                fill_pattern_fast(f2_ptr, pattern_buf.as_ptr(), pattern_len, in_f2);
+            }
+        }
+        // SAFETY: Upholds invariant 3 by wrapping `tail` around.
+        self.tail = (self.tail + len) % self.cap;
+    }
+
     /// Advance head past `amount` elements, effectively removing
     /// them from the buffer.
     pub fn drop_first_n(&mut self, amount: usize) {
@@ -684,6 +729,83 @@ unsafe fn copy_bytes_overshooting(
 unsafe fn fill_byte_fast(dst: *mut u8, byte: u8, len: usize) {
     // Non-SIMD fallback: use write_bytes (memset)
     dst.write_bytes(byte, len);
+}
+
+/// Fill `len` bytes at `dst` by repeating a pattern of `pattern_len` bytes starting at `pattern`.
+/// `pattern_len` must be 2, 4, or 8.
+/// Optimized for WASM SIMD when available.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+#[inline(always)]
+unsafe fn fill_pattern_fast(dst: *mut u8, pattern: *const u8, pattern_len: usize, len: usize) {
+    debug_assert!(pattern_len == 2 || pattern_len == 4 || pattern_len == 8);
+
+    let mut offset = 0;
+    while offset < len {
+        let byte_idx = offset % pattern_len;
+        *dst.add(offset) = *pattern.add(byte_idx);
+        offset += 1;
+    }
+}
+
+/// WASM SIMD128 optimized version of fill_pattern_fast.
+/// Uses SIMD shuffle to replicate 2, 4, or 8-byte patterns into 16-byte vectors.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+unsafe fn fill_pattern_fast(dst: *mut u8, pattern: *const u8, pattern_len: usize, len: usize) {
+    use core::arch::wasm32::{i8x16_shuffle, v128, v128_load, v128_store};
+
+    const SIMD_WIDTH: usize = 16;
+
+    if len >= SIMD_WIDTH {
+        // Load the pattern bytes into a v128 (only first pattern_len bytes matter)
+        // We need to create a 16-byte aligned buffer with the pattern
+        let mut pattern_buf = [0u8; 16];
+        for i in 0..pattern_len {
+            pattern_buf[i] = *pattern.add(i);
+        }
+        let base = v128_load(pattern_buf.as_ptr() as *const v128);
+
+        // Create a v128 with the pattern repeated to fill 16 bytes
+        let repeated = match pattern_len {
+            2 => {
+                // Repeat 2-byte pattern 8 times: [0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1]
+                i8x16_shuffle::<0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1>(base, base)
+            }
+            4 => {
+                // Repeat 4-byte pattern 4 times: [0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3]
+                i8x16_shuffle::<0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3>(base, base)
+            }
+            8 => {
+                // Repeat 8-byte pattern 2 times: [0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]
+                i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7>(base, base)
+            }
+            _ => {
+                // Should not happen, but fallback
+                base
+            }
+        };
+
+        let mut offset = 0;
+
+        // Write 16 bytes at a time
+        while offset + SIMD_WIDTH <= len {
+            v128_store(dst.add(offset) as *mut v128, repeated);
+            offset += SIMD_WIDTH;
+        }
+
+        // Handle remaining bytes
+        let remainder = len - offset;
+        if remainder > 0 {
+            for i in 0..remainder {
+                *dst.add(offset + i) = *pattern.add(i % pattern_len);
+            }
+        }
+    } else {
+        // Small fills: just write bytes directly
+        for i in 0..len {
+            *dst.add(i) = *pattern.add(i % pattern_len);
+        }
+    }
 }
 
 /// WASM SIMD128 optimized version of fill_byte_fast.

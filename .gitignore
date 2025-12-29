@@ -7,3 +7,8 @@ Cargo.lock
 fuzz_decodecorpus
 perf.data*
 fuzz/corpus
+
+# wasm-bench generated files
+wasm-bench/pkg-no-simd/
+wasm-bench/pkg-simd/
+generate_test_data.py

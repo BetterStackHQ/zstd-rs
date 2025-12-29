@@ -108,6 +108,13 @@ impl DecodeBuffer {
             return;
         }
 
+        // Special case for small offsets (2, 4, 8): use SIMD pattern fill
+        // This is much faster than copying in chunks for these common cases
+        if offset == 2 || offset == 4 || offset == 8 {
+            self.buffer.extend_with_pattern(start_idx, offset, match_length);
+            return;
+        }
+
         // We have at max offset bytes in one chunk, the last one can be smaller
         let mut start_idx = start_idx;
         let mut copied_counter_left = match_length;
