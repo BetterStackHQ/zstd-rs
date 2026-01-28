@@ -4,7 +4,7 @@ use super::super::blocks::literals_section::LiteralsSection;
 use super::super::blocks::literals_section::LiteralsSectionType;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::decode_literals;
-use super::sequence_section_decoder::decode_sequences;
+use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
@@ -12,7 +12,6 @@ use crate::decoding::errors::{
     DecompressBlockError,
 };
 use crate::decoding::scratch::DecoderScratch;
-use crate::decoding::sequence_execution::execute_sequences;
 use crate::io::Read;
 
 pub struct BlockDecoder {
@@ -199,14 +198,16 @@ impl BlockDecoder {
         vprintln!("Slice for sequences: {}", raw.len());
 
         if seq_section.num_sequences != 0 {
-            decode_sequences(
+            // Use fused decode+execute to avoid intermediate Vec<Sequence> allocation
+            // The fields are passed separately to satisfy the borrow checker
+            decode_and_execute_sequences(
                 &seq_section,
                 raw,
                 &mut workspace.fse,
-                &mut workspace.sequences,
+                &workspace.literals_buffer,
+                &mut workspace.buffer,
+                &mut workspace.offset_hist,
             )?;
-            vprintln!("Executing sequences");
-            execute_sequences(workspace)?;
         } else {
             if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(
@@ -216,7 +217,6 @@ impl BlockDecoder {
                 ));
             }
             workspace.buffer.push(&workspace.literals_buffer);
-            workspace.sequences.clear();
         }
 
         Ok(())

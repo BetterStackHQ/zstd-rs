@@ -15,5 +15,6 @@ pub(crate) mod literals_section_decoder;
 mod ringbuffer;
 #[allow(dead_code)]
 pub(crate) mod scratch;
+#[allow(dead_code)]
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;

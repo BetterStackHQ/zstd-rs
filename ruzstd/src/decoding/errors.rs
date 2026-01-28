@@ -340,6 +340,15 @@ impl From<ExecuteSequencesError> for DecompressBlockError {
     }
 }
 
+impl From<DecodeAndExecuteError> for DecompressBlockError {
+    fn from(val: DecodeAndExecuteError) -> Self {
+        match val {
+            DecodeAndExecuteError::DecodeSequence(e) => Self::DecodeSequenceError(e),
+            DecodeAndExecuteError::ExecuteSequences(e) => Self::ExecuteSequencesError(e),
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeBlockContentError {
@@ -715,6 +724,63 @@ impl std::error::Error for ExecuteSequencesError {
 impl From<DecodeBufferError> for ExecuteSequencesError {
     fn from(val: DecodeBufferError) -> Self {
         Self::DecodebufferError(val)
+    }
+}
+
+/// Error type for the fused decode+execute operation
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DecodeAndExecuteError {
+    DecodeSequence(DecodeSequenceError),
+    ExecuteSequences(ExecuteSequencesError),
+}
+
+impl core::fmt::Display for DecodeAndExecuteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DecodeAndExecuteError::DecodeSequence(e) => write!(f, "{e}"),
+            DecodeAndExecuteError::ExecuteSequences(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DecodeAndExecuteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecodeAndExecuteError::DecodeSequence(source) => Some(source),
+            DecodeAndExecuteError::ExecuteSequences(source) => Some(source),
+        }
+    }
+}
+
+impl From<DecodeSequenceError> for DecodeAndExecuteError {
+    fn from(val: DecodeSequenceError) -> Self {
+        Self::DecodeSequence(val)
+    }
+}
+
+impl From<ExecuteSequencesError> for DecodeAndExecuteError {
+    fn from(val: ExecuteSequencesError) -> Self {
+        Self::ExecuteSequences(val)
+    }
+}
+
+impl From<DecodeBufferError> for DecodeAndExecuteError {
+    fn from(val: DecodeBufferError) -> Self {
+        Self::ExecuteSequences(ExecuteSequencesError::DecodebufferError(val))
+    }
+}
+
+impl From<FSEDecoderError> for DecodeAndExecuteError {
+    fn from(val: FSEDecoderError) -> Self {
+        Self::DecodeSequence(DecodeSequenceError::FSEDecoderError(val))
+    }
+}
+
+impl From<FSETableError> for DecodeAndExecuteError {
+    fn from(val: FSETableError) -> Self {
+        Self::DecodeSequence(DecodeSequenceError::FSETableError(val))
     }
 }
 

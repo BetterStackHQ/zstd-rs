@@ -6,11 +6,15 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::decoding::errors::DecodeSequenceError;
+use crate::decoding::decode_buffer::DecodeBuffer;
+use crate::decoding::errors::{DecodeAndExecuteError, DecodeSequenceError, ExecuteSequencesError};
 use crate::fse::FSEDecoder;
 use alloc::vec::Vec;
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
+/// NOTE: This function is superseded by `decode_and_execute_sequences` which fuses
+/// decoding and execution for better performance.
+#[allow(dead_code)]
 pub fn decode_sequences(
     section: &SequencesHeader,
     source: &[u8],
@@ -46,6 +50,321 @@ pub fn decode_sequences(
     }
 }
 
+/// Fused decode and execute: decodes sequences and executes them immediately without
+/// intermediate storage in a Vec. This avoids memory allocation and improves cache locality
+/// by keeping decoded sequence data in registers.
+///
+/// The fields are passed separately to satisfy the borrow checker - `source` comes from
+/// `block_content_buffer` while `buffer` and `offset_hist` need mutable access.
+pub fn decode_and_execute_sequences(
+    section: &SequencesHeader,
+    source: &[u8],
+    scratch: &mut FSEScratch,
+    literals: &[u8],
+    buffer: &mut DecodeBuffer,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), DecodeAndExecuteError> {
+    let bytes_read = maybe_update_fse_tables(section, source, scratch)?;
+
+    let bit_stream = &source[bytes_read..];
+    let mut br = BitReaderReversed::new(bit_stream);
+
+    // Skip the 0 padding at the end of the last byte of the bitstream and throw away the first 1 found
+    let mut skipped_bits = 0;
+    loop {
+        let val = br.get_bits(1);
+        skipped_bits += 1;
+        if val == 1 || skipped_bits > 8 {
+            break;
+        }
+    }
+    if skipped_bits > 8 {
+        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
+    }
+
+    if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
+        decode_and_execute_with_rle(section, &mut br, scratch, literals, buffer, offset_hist)
+    } else {
+        decode_and_execute_without_rle(section, &mut br, scratch, literals, buffer, offset_hist)
+    }
+}
+
+fn decode_and_execute_with_rle(
+    section: &SequencesHeader,
+    br: &mut BitReaderReversed<'_>,
+    scratch: &FSEScratch,
+    literals: &[u8],
+    buffer: &mut DecodeBuffer,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), DecodeAndExecuteError> {
+    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
+    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
+    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+
+    if scratch.ll_rle.is_none() {
+        ll_dec.init_state(br)?;
+    }
+    if scratch.of_rle.is_none() {
+        of_dec.init_state(br)?;
+    }
+    if scratch.ml_rle.is_none() {
+        ml_dec.init_state(br)?;
+    }
+
+    let mut literals_copy_counter = 0;
+
+    for seq_idx in 0..section.num_sequences {
+        // Decode the sequence
+        let ll_code = if scratch.ll_rle.is_some() {
+            scratch.ll_rle.unwrap()
+        } else {
+            ll_dec.decode_symbol()
+        };
+        let ml_code = if scratch.ml_rle.is_some() {
+            scratch.ml_rle.unwrap()
+        } else {
+            ml_dec.decode_symbol()
+        };
+        let of_code = if scratch.of_rle.is_some() {
+            scratch.of_rle.unwrap()
+        } else {
+            of_dec.decode_symbol()
+        };
+
+        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+        if of_code > MAX_OFFSET_CODE {
+            return Err(DecodeSequenceError::UnsupportedOffset {
+                offset_code: of_code,
+            }
+            .into());
+        }
+
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + (1u32 << of_code);
+
+        if offset == 0 {
+            return Err(DecodeSequenceError::ZeroOffset.into());
+        }
+
+        let ll = ll_value + ll_add as u32;
+        let ml = ml_value + ml_add as u32;
+
+        // Execute the sequence immediately
+        if ll > 0 {
+            let high = literals_copy_counter + ll as usize;
+            if high > literals.len() {
+                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                    wanted: high,
+                    have: literals.len(),
+                }
+                .into());
+            }
+            let lit_slice = &literals[literals_copy_counter..high];
+            literals_copy_counter += ll as usize;
+            buffer.push(lit_slice);
+        }
+
+        let actual_offset = do_offset_history(offset, ll, offset_hist);
+        if actual_offset == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset.into());
+        }
+        if ml > 0 {
+            buffer.repeat(actual_offset as usize, ml as usize)?;
+        }
+
+        // Update FSE state for next iteration (except last)
+        if seq_idx + 1 < section.num_sequences {
+            if scratch.ll_rle.is_none() {
+                ll_dec.update_state(br);
+            }
+            if scratch.ml_rle.is_none() {
+                ml_dec.update_state(br);
+            }
+            if scratch.of_rle.is_none() {
+                of_dec.update_state(br);
+            }
+        }
+
+        if br.bits_remaining() < 0 {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+        }
+    }
+
+    // Copy any remaining literals after all sequences
+    if literals_copy_counter < literals.len() {
+        let rest_literals = &literals[literals_copy_counter..];
+        buffer.push(rest_literals);
+    }
+
+    if br.bits_remaining() > 0 {
+        Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: br.bits_remaining(),
+        }
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+fn decode_and_execute_without_rle(
+    section: &SequencesHeader,
+    br: &mut BitReaderReversed<'_>,
+    scratch: &FSEScratch,
+    literals: &[u8],
+    buffer: &mut DecodeBuffer,
+    offset_hist: &mut [u32; 3],
+) -> Result<(), DecodeAndExecuteError> {
+    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
+    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
+    let mut of_dec = FSEDecoder::new(&scratch.offsets);
+
+    ll_dec.init_state(br)?;
+    of_dec.init_state(br)?;
+    ml_dec.init_state(br)?;
+
+    let mut literals_copy_counter = 0;
+
+    for seq_idx in 0..section.num_sequences {
+        // Decode the sequence
+        let ll_code = ll_dec.decode_symbol();
+        let ml_code = ml_dec.decode_symbol();
+        let of_code = of_dec.decode_symbol();
+
+        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+        if of_code > MAX_OFFSET_CODE {
+            return Err(DecodeSequenceError::UnsupportedOffset {
+                offset_code: of_code,
+            }
+            .into());
+        }
+
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + (1u32 << of_code);
+
+        if offset == 0 {
+            return Err(DecodeSequenceError::ZeroOffset.into());
+        }
+
+        let ll = ll_value + ll_add as u32;
+        let ml = ml_value + ml_add as u32;
+
+        // Execute the sequence immediately
+        if ll > 0 {
+            let high = literals_copy_counter + ll as usize;
+            if high > literals.len() {
+                return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
+                    wanted: high,
+                    have: literals.len(),
+                }
+                .into());
+            }
+            let lit_slice = &literals[literals_copy_counter..high];
+            literals_copy_counter += ll as usize;
+            buffer.push(lit_slice);
+        }
+
+        let actual_offset = do_offset_history(offset, ll, offset_hist);
+        if actual_offset == 0 {
+            return Err(ExecuteSequencesError::ZeroOffset.into());
+        }
+        if ml > 0 {
+            buffer.repeat(actual_offset as usize, ml as usize)?;
+        }
+
+        // Update FSE state for next iteration (except last)
+        if seq_idx + 1 < section.num_sequences {
+            ll_dec.update_state(br);
+            ml_dec.update_state(br);
+            of_dec.update_state(br);
+        }
+
+        if br.bits_remaining() < 0 {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+        }
+    }
+
+    // Copy any remaining literals after all sequences
+    if literals_copy_counter < literals.len() {
+        let rest_literals = &literals[literals_copy_counter..];
+        buffer.push(rest_literals);
+    }
+
+    if br.bits_remaining() > 0 {
+        Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: br.bits_remaining(),
+        }
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Update the most recently used offsets to reflect the provided offset value, and return the
+/// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
+/// before you get a functional number.
+fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+    let actual_offset = if lit_len > 0 {
+        match offset_value {
+            1..=3 => scratch[offset_value as usize - 1],
+            _ => {
+                // new offset
+                offset_value - 3
+            }
+        }
+    } else {
+        match offset_value {
+            1..=2 => scratch[offset_value as usize],
+            3 => scratch[0].wrapping_sub(1),
+            _ => {
+                // new offset
+                offset_value - 3
+            }
+        }
+    };
+
+    // Update history
+    if lit_len > 0 {
+        match offset_value {
+            1 => {
+                // nothing
+            }
+            2 => {
+                scratch[1] = scratch[0];
+                scratch[0] = actual_offset;
+            }
+            _ => {
+                scratch[2] = scratch[1];
+                scratch[1] = scratch[0];
+                scratch[0] = actual_offset;
+            }
+        }
+    } else {
+        match offset_value {
+            1 => {
+                scratch[1] = scratch[0];
+                scratch[0] = actual_offset;
+            }
+            2 => {
+                scratch[2] = scratch[1];
+                scratch[1] = scratch[0];
+                scratch[0] = actual_offset;
+            }
+            _ => {
+                scratch[2] = scratch[1];
+                scratch[1] = scratch[0];
+                scratch[0] = actual_offset;
+            }
+        }
+    }
+
+    actual_offset
+}
+
+#[allow(dead_code)]
 fn decode_sequences_with_rle(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_>,
@@ -151,6 +470,7 @@ fn decode_sequences_with_rle(
     }
 }
 
+#[allow(dead_code)]
 fn decode_sequences_without_rle(
     section: &SequencesHeader,
     br: &mut BitReaderReversed<'_>,
