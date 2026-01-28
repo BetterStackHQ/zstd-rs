@@ -464,13 +464,16 @@ impl FrameDecoder {
                     }
                     state.bytes_read_counter += u64::from(block_header_size);
 
+                    // Use slice-based decode to avoid copying into block_content_buffer
                     let bytes_read_in_block_body = block_dec
-                        .decode_block_content(
+                        .decode_block_content_from_slice(
                             &block_header,
                             &mut state.decoder_scratch,
-                            &mut mt_source,
+                            mt_source,
                         )
                         .map_err(err::FailedToReadBlockBody)?;
+                    // Advance the slice past consumed bytes
+                    mt_source = &mt_source[bytes_read_in_block_body as usize..];
                     state.bytes_read_counter += bytes_read_in_block_body;
                     state.block_counter += 1;
 

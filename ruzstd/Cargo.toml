@@ -48,3 +48,7 @@ rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
 name = "decode_all"
 harness = false
 
+[[bench]]
+name = "decode_streaming"
+harness = false
+
