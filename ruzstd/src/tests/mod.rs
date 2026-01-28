@@ -573,6 +573,121 @@ fn test_decode_all() {
     assert_eq!(output, original);
 }
 
+/// Test for bug where decode_from_to returns bytes_read=4 even when
+/// not enough bytes were available to read the checksum.
+///
+/// The bug occurs when:
+/// 1. Frame has checksum flag enabled
+/// 2. Last block is decoded, but checksum bytes arrive in a subsequent call
+/// 3. The subsequent call has fewer than 4 bytes available for the checksum
+/// 4. The function incorrectly returns (4, 0) claiming 4 bytes were read when 0 were
+#[test]
+#[cfg(feature = "hash")]
+fn test_checksum_bytes_read_bug() {
+    use crate::decoding::FrameDecoder;
+    use crate::encoding::{compress_to_vec, CompressionLevel};
+
+    // Compress some test data - with the "hash" feature enabled, this includes a checksum
+    let original_data = b"Hello, this is test data for checksum handling!";
+    let compressed = compress_to_vec(original_data.as_slice(), CompressionLevel::Uncompressed);
+
+    // The compressed data should end with a 4-byte checksum
+    // We'll feed it to the decoder in chunks to trigger the bug
+    let mut frame_dec = FrameDecoder::new();
+    let mut target = vec![0u8; 1024];
+
+    // Feed all bytes except the last 4 (the checksum)
+    let without_checksum = &compressed[..compressed.len() - 4];
+    let (read1, _written1) = frame_dec
+        .decode_from_to(without_checksum, target.as_mut_slice())
+        .unwrap();
+
+    // Verify we consumed everything except the checksum
+    assert_eq!(read1, without_checksum.len(), "Should have read all bytes except checksum");
+
+    // Frame should not be finished yet (checksum not read)
+    assert!(!frame_dec.is_finished(), "Frame should not be finished without checksum");
+
+    // Now feed ONLY 2 bytes of the checksum (less than the required 4)
+    let partial_checksum = &compressed[compressed.len() - 4..compressed.len() - 2];
+    assert_eq!(partial_checksum.len(), 2);
+
+    let (read2, written2) = frame_dec
+        .decode_from_to(partial_checksum, &mut target[..])
+        .unwrap();
+
+    // BUG: The current code returns (4, 0) here even though only 2 bytes were available!
+    // The correct behavior is to return (0, 0) since we can't read the full checksum yet
+    assert_eq!(
+        read2, 0,
+        "Should return 0 bytes read when checksum is incomplete, but got {}",
+        read2
+    );
+    assert_eq!(written2, 0, "Should write 0 bytes when checksum is incomplete");
+
+    // Frame should still not be finished
+    assert!(!frame_dec.is_finished(), "Frame should not be finished with partial checksum");
+
+    // Now feed all 4 checksum bytes
+    let full_checksum = &compressed[compressed.len() - 4..];
+    assert_eq!(full_checksum.len(), 4);
+
+    let (read3, written3) = frame_dec
+        .decode_from_to(full_checksum, &mut target[..])
+        .unwrap();
+
+    // Now we should have read exactly 4 bytes (the checksum)
+    assert_eq!(read3, 4, "Should read exactly 4 bytes for the checksum");
+    assert_eq!(written3, 0, "Should write 0 bytes when only processing checksum");
+
+    // Frame should now be finished
+    assert!(frame_dec.is_finished(), "Frame should be finished after reading checksum");
+}
+
+/// Additional test: feeding checksum one byte at a time
+#[test]
+#[cfg(feature = "hash")]
+fn test_checksum_byte_by_byte() {
+    use crate::decoding::FrameDecoder;
+    use crate::encoding::{compress_to_vec, CompressionLevel};
+
+    let original_data = b"Test data for byte-by-byte checksum test";
+    let compressed = compress_to_vec(original_data.as_slice(), CompressionLevel::Uncompressed);
+
+    let mut frame_dec = FrameDecoder::new();
+    let mut target = vec![0u8; 1024];
+
+    // Feed all bytes except the last 4 (the checksum)
+    let without_checksum = &compressed[..compressed.len() - 4];
+    let (read1, _written1) = frame_dec
+        .decode_from_to(without_checksum, target.as_mut_slice())
+        .unwrap();
+    assert_eq!(read1, without_checksum.len());
+
+    // Try to feed checksum bytes one at a time - should all return (0, 0) until we have 4 bytes
+    for i in 0..3 {
+        let one_byte = &compressed[compressed.len() - 4 + i..compressed.len() - 4 + i + 1];
+        let (read, written) = frame_dec
+            .decode_from_to(one_byte, &mut target[..])
+            .unwrap();
+        assert_eq!(
+            read, 0,
+            "Byte {}: Should return 0 bytes read when checksum is incomplete",
+            i
+        );
+        assert_eq!(written, 0);
+        assert!(!frame_dec.is_finished());
+    }
+
+    // Feed all 4 checksum bytes at once to complete
+    let full_checksum = &compressed[compressed.len() - 4..];
+    let (read_final, _) = frame_dec
+        .decode_from_to(full_checksum, &mut target[..])
+        .unwrap();
+    assert_eq!(read_final, 4);
+    assert!(frame_dec.is_finished());
+}
+
 pub mod bit_reader;
 pub mod decode_corpus;
 pub mod dict_test;

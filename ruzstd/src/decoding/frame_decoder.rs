@@ -442,8 +442,10 @@ impl FrameDecoder {
                         state.bytes_read_counter += 4;
                         let chksum = u32::from_le_bytes(chksum);
                         state.check_sum = Some(chksum);
+                        return Ok((4, 0));
                     }
-                    return Ok((4, 0));
+                    // Not enough bytes for checksum yet, report no progress
+                    return Ok((0, 0));
                 }
 
                 loop {
