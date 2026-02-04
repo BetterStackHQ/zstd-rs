@@ -1,11 +1,27 @@
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
+/// Extra bytes allocated beyond `cap` to allow SIMD operations to safely
+/// "overshoot" reads/writes without accessing unmapped memory.
+/// This is particularly important for WASM where memory access is strictly bounds-checked.
+const SIMD_PADDING: usize = 16;
+
+/// Calculate the actual allocation size including SIMD padding.
+/// Returns 0 if cap is 0 (no allocation needed).
+#[inline]
+const fn allocation_size(cap: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        cap + SIMD_PADDING
+    }
+}
+
 pub struct RingBuffer {
     // Safety invariants:
     //
     // 1.
-    //    a.`buf` must be a valid allocation of capacity `cap`
+    //    a.`buf` must be a valid allocation of size `allocation_size(cap)` (i.e., `cap + SIMD_PADDING`)
     //    b. ...unless `cap=0`, in which case it is dangling
     // 2. If tail≥head
     //    a. `head..tail` must contain initialized memory.
@@ -13,6 +29,7 @@ pub struct RingBuffer {
     // 3. `head` and `tail` are in bounds (≥ 0 and < cap)
     // 4. `tail` is never `cap` except for a full buffer, and instead uses the value `0`. In other words, `tail` always points to the place
     //    where the next element would go (if there is space)
+    // 5. The SIMD_PADDING bytes after `cap` may be read/written by SIMD operations but are not part of the logical buffer
     buf: NonNull<u8>,
     cap: usize,
     head: usize,
@@ -71,7 +88,8 @@ impl RingBuffer {
     #[cold]
     fn reserve_amortized(&mut self, amount: usize) {
         // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        let current_alloc_size = allocation_size(self.cap);
+        let current_layout = unsafe { Layout::array::<u8>(current_alloc_size).unwrap_unchecked() };
 
         // Always have at least 1 unused element as the sentinel.
         let new_cap = usize::max(
@@ -86,8 +104,10 @@ impl RingBuffer {
             debug_assert!(usize::BITS >= 64 || new_cap < isize::MAX as usize);
         }
 
-        let new_layout = Layout::array::<u8>(new_cap)
-            .unwrap_or_else(|_| panic!("Could not create layout for u8 array of size {}", new_cap));
+        // Allocate with SIMD_PADDING extra bytes to allow safe overshooting in SIMD operations
+        let new_alloc_size = allocation_size(new_cap);
+        let new_layout = Layout::array::<u8>(new_alloc_size)
+            .unwrap_or_else(|_| panic!("Could not create layout for u8 array of size {}", new_alloc_size));
 
         // alloc the new memory region and panic if alloc fails
         // TODO maybe rework this to generate an error?
@@ -608,9 +628,11 @@ impl Drop for RingBuffer {
             return;
         }
 
-        // SAFETY: is we were succesfully able to construct this layout when we allocated then it's also valid do so now
+        // SAFETY: if we were succesfully able to construct this layout when we allocated then it's also valid do so now
         // Relies on / establishes invariant 1
-        let current_layout = unsafe { Layout::array::<u8>(self.cap).unwrap_unchecked() };
+        // Must use the same allocation_size() that was used during reserve_amortized
+        let alloc_size = allocation_size(self.cap);
+        let current_layout = unsafe { Layout::array::<u8>(alloc_size).unwrap_unchecked() };
 
         unsafe {
             dealloc(self.buf.as_ptr(), current_layout);
